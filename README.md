@@ -7,6 +7,6 @@ make init
 ### Compile and run
 ```
 make
-./main
+./main -d [dir_to_files]
 ```
 
