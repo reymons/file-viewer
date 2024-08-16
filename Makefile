@@ -9,7 +9,7 @@ OUT=main
 CC_INCLUDES=$(foreach DEP,$(SDL_DEPS),-I$(LIBS_DIR)/$(DEP)/include/SDL2)
 CC_LIB_DIRS=$(foreach DEP,$(DEPS),-L$(LIBS_DIR)/$(DEP)/lib)
 CC_LIBS=$(foreach DEP,$(DEPS),-l$(DEP))
-CFLAGS=-Os -Wall -Wextra -pedantic $(CC_INCLUDES) $(CC_LIB_DIRS) $(CC_LIBS)
+CFLAGS=-O3 -Wall -Wextra -pedantic $(CC_INCLUDES) $(CC_LIB_DIRS) $(CC_LIBS)
 SDL2_CONFIG=$(LIBS_DIR)/SDL2/bin/sdl2-config
 
 all:
