@@ -3,6 +3,8 @@
 #include <time.h>
 #include <dirent.h>
 #include <limits.h>
+#include <pthread.h>
+#include <unistd.h>
 
 #define WIN_WIDTH       800
 #define WIN_HEIGHT      600
@@ -16,11 +18,14 @@ typedef SDL_Window   win_t;
 typedef SDL_Renderer ren_t;
 typedef SDL_FRect    rectf_t;
 
-typedef struct {
-    rectf_t rect;
-    float nat_w, nat_h;
-    SDL_Texture *tex;
-    char *path;
+typedef struct file_t {
+    ino_t           ino;
+    rectf_t         rect;
+    float           nat_w, nat_h;
+    SDL_Texture     *tex;
+    char            *path;
+    struct file_t   *prev;
+    struct file_t   *next;
 } file_t;
 
 typedef enum {
@@ -41,11 +46,22 @@ typedef struct {
     float       win_w, win_h;
     float       screen_w, screen_h;
     mbutton_t   mbuttons[MAX_MOUSE_BUTTONS];
-    file_t      *files[MAX_FILES];
-    file_t      *file;
-    size_t      files_idx;
-    size_t      file_idx;
+    struct {
+        file_t  *head;
+        file_t  *current;
+        file_t  *tail;
+        size_t  total;
+    } files;
 } app_t;
+
+typedef struct {
+    DIR                 *dir;
+    app_t               *app;
+    const char          *path;
+    pthread_mutex_t     lock;
+    size_t              i;
+    size_t              max;
+} app_ldt_ctx_t;
 
 // Misc 
 int has_ext(const char *str, const char *ext);
@@ -54,6 +70,7 @@ int is_image(const char *path);
 // App
 void app_fail(const char *label);
 void app_update_size_data(app_t *app);
+void app_free_files(app_t *app);
 void app_render_file(app_t *app);
 void app_to_screen(const app_t *app, float x, float y, float *dst_x, float *dst_y);
 void app_load_dir(app_t *app, const char *path, size_t max);
@@ -85,7 +102,7 @@ int main(int argc, char *argv[])
     srand(time(NULL));
 
     char *dir = NULL;
-    char *file = NULL;
+    char *file_name = NULL;
     size_t max = 0;
 
     for (int i = 1; i < argc; i++) {
@@ -94,16 +111,18 @@ int main(int argc, char *argv[])
         if (strcmp(arg, "-d") == 0) {
             dir = argv[++i];
         } else if (SDL_strcmp(arg, "-f") == 0) {
-            file = argv[++i];
+            file_name = argv[++i];
         } else if (SDL_strcmp(arg, "-m") == 0) {
             max = SDL_atoi(argv[++i]);
         }
     }
 
-    if (dir == NULL && file == NULL) {
-        printf("Expected at least -d or -f flag");
+    if (dir == NULL && file_name == NULL) {
+        SDL_Log("Expected at least -d or -f flag");
         exit(1);
     }
+
+    max = max == 0 ? MAX_FILES : max;
 
     app_t app;
     SDL_memset(&app, 0, sizeof(app));
@@ -131,29 +150,31 @@ int main(int argc, char *argv[])
 
     if (dir != NULL) {
         app_load_dir(&app, dir, max);
-        if (app.files_idx == 0) {
-            printf("No files found\n");
+        if (app.files.head == NULL) {
+            SDL_Log("No files found\n");
             exit(1);
         }
     } else {
-        printf("TODO: load single file");
+        SDL_Log("TODO: load single file");
         exit(1);
     }
 
     // Find initial file
-    if (file == NULL) {
-        app.file = app.files[app.file_idx];
+    if (file_name == NULL) {
+        app.files.current = app.files.head;
     } else {
-        for (size_t i = 0; i < app.files_idx; i++) {
-            if (SDL_strcmp(app.files[i]->path, file) == 0) {
-                app.file = app.files[i];
+        file_t *file = app.files.head;
+        while (file != NULL) {
+            if (SDL_strcmp(file->path, file_name) == 0) {
+                app.files.current = file;
                 break;
             }
+            file = file->next;
         }
     }
 
-    if (app.file == NULL) {
-        printf("Can't find the any file");
+    if (app.files.current == NULL) {
+        SDL_Log("Can't find any file");
         exit(1);
     }
 
@@ -170,7 +191,7 @@ int main(int argc, char *argv[])
 
     SDL_DestroyRenderer(app.ren);
     SDL_DestroyWindow(app.win);
-    file_free(app.file);
+    app_free_files(&app);
     IMG_Quit();
     SDL_Quit();
 
@@ -194,15 +215,8 @@ int is_image(const char *path)
 // App
 void app_fail(const char *label)
 {
-    printf("%s: %s\n", label, SDL_GetError());
+    SDL_Log("%s: %s\n", label, SDL_GetError());
     exit(1);   
-}
-
-void app_set_file(app_t *app, size_t file_idx)
-{
-    file_idx %= MAX_FILES - 1;
-    app->file_idx = file_idx;
-    app->file = app->files[file_idx];
 }
 
 void app_update_size_data(app_t *app)
@@ -216,27 +230,37 @@ void app_update_size_data(app_t *app)
     app->screen_h = screen_h * 1.0;
 }
 
+void app_free_files(app_t *app)
+{
+    file_t *file = app->files.head;
+    while (file != NULL) {
+        file_t *next = file->next;
+        file_free(file);
+        file = next;
+    }
+}
+
 void app_render_file(app_t *app)
 {
-    SDL_SetWindowTitle(app->win, app->file->path);
+    SDL_SetWindowTitle(app->win, app->files.current->path);
 
-    float tex_aspect = app->file->nat_w / app->file->nat_h;
+    float tex_aspect = app->files.current->nat_w / app->files.current->nat_h;
     float screen_aspect = app->screen_w / app->screen_h;
 
     if (tex_aspect > screen_aspect) {
         // Texture is wider relative to its height than the container
-        app->file->rect.w = app->screen_w;
-        app->file->rect.h = app->screen_w / tex_aspect;
+        app->files.current->rect.w = app->screen_w;
+        app->files.current->rect.h = app->screen_w / tex_aspect;
     } else {
         // Texture is taller relative to its width than the container
-        app->file->rect.h = app->screen_h;
-        app->file->rect.w = app->screen_h * tex_aspect;
+        app->files.current->rect.h = app->screen_h;
+        app->files.current->rect.w = app->screen_h * tex_aspect;
     }
 
-    app->file->rect.x = app->screen_w / 2 - app->file->rect.w / 2;
-    app->file->rect.y = app->screen_h / 2 - app->file->rect.h / 2;
+    app->files.current->rect.x = app->screen_w / 2 - app->files.current->rect.w / 2;
+    app->files.current->rect.y = app->screen_h / 2 - app->files.current->rect.h / 2;
     
-    file_render(app->ren, app->file);
+    file_render(app->ren, app->files.current);
 }
 
 void app_to_screen(const app_t *app, float x, float y, float *dst_x, float *dst_y)
@@ -245,29 +269,80 @@ void app_to_screen(const app_t *app, float x, float y, float *dst_x, float *dst_
     *dst_y = y * (app->screen_h / app->win_h);
 }
 
+void *app_load_dir_thread(void *data)
+{
+    app_ldt_ctx_t *ctx = (app_ldt_ctx_t *)data;
+    struct dirent *ent;
+
+    while (1) {
+        pthread_mutex_lock(&ctx->lock);
+        ent = readdir(ctx->dir);
+        pthread_mutex_unlock(&ctx->lock);
+        
+        if (ent == NULL) break;
+        
+        if (ent->d_type == DT_REG && is_image(ent->d_name)) {
+            char file_path[FILEPATH_MAX]; 
+            SDL_snprintf(file_path, FILEPATH_MAX, "%s/%s", ctx->path, ent->d_name);
+            SDL_Log("Loading %s\n", file_path);
+            
+            file_t *file = file_load(ctx->app->ren, file_path, 0, 0, 0, 0);
+
+            if (file != NULL) {
+                file->ino = ent->d_ino;
+
+                pthread_mutex_lock(&ctx->lock);
+                ctx->app->files.total++;
+
+                if (ctx->app->files.head == NULL) {
+                    ctx->app->files.head = file;
+                    ctx->app->files.tail = file;
+                    ctx->app->files.current = file;
+                    file->prev = file->next = NULL;
+                } else {
+                    file->prev = ctx->app->files.tail;
+                    ctx->app->files.tail->next = file;
+                    ctx->app->files.tail = file;
+                    ctx->app->files.current = file;
+                }
+
+                pthread_mutex_unlock(&ctx->lock);
+            }
+        }
+    }
+
+    return NULL;
+}
+
 void app_load_dir(app_t *app, const char *path, size_t max)
 {
     DIR *dir = opendir(path);
     if (dir == NULL) app_fail("opendir");
 
-    size_t i = 1;
-    struct dirent *dent;
+    pthread_t tids[24] = {0};
+    size_t cpus = (sysconf(_SC_NPROCESSORS_ONLN) + 2) % sizeof(tids);
 
-    while ((dent = readdir(dir)) != NULL) {
-        if (max > 0 && i > max) break;
+    app_ldt_ctx_t ctx = {
+        .dir  = dir,
+        .app  = app,
+        .path = path,
+        .i    = 0,
+        .max  = max % (MAX_FILES + 1),
+    };
 
-        if (dent->d_type == DT_REG && is_image(dent->d_name)) {
-            char file_path[FILEPATH_MAX]; 
-            SDL_snprintf(file_path, FILEPATH_MAX, "%s/%s", path, dent->d_name);
-            printf("Loading %s\n", file_path);
-            
-            file_t *file = file_load(app->ren, file_path, 0, 0, 0, 0);
+    pthread_mutex_init(&ctx.lock, NULL);
+    
+    for (size_t i = 0; i < cpus; i++) {
+        if (pthread_create(&tids[i], NULL, app_load_dir_thread, &ctx) != 0) {
+            SDL_Log("Couldn't create a thread\n");
+            exit(1);
+        }
+    }
 
-            if (file != NULL) {
-                app->files[app->files_idx++] = file;
-                i++;
-            }
-            
+    for (size_t i = 0; i < cpus; i++) {
+        if (pthread_join(tids[i], NULL) != 0) {
+            SDL_Log("Couldn't wait for a thread\n");
+            exit(1);
         }
     }
 
@@ -276,16 +351,33 @@ void app_load_dir(app_t *app, const char *path, size_t max)
 
 void app_render_random_file(app_t *app)
 {
-    app_set_file(app, rand() % app->files_idx);
-    SDL_RenderClear(app->ren);
-    app_render_file(app);
-    SDL_RenderPresent(app->ren);
+    size_t idx = rand() % app->files.total;
+    size_t i = 0;
+    file_t *file = app->files.head;
+
+    while (file != NULL) {
+        if (idx == i++) break;
+        file = file->next;
+    }
+
+    if (file != NULL) {
+        SDL_RenderClear(app->ren);
+        app->files.current = file;
+        app_render_file(app);
+        SDL_RenderPresent(app->ren);
+    }
 } 
 
 void app_render_prev_file(app_t *app)
 {
-    size_t next_idx = app->file_idx == 0 ? app->files_idx - 1 : app->file_idx - 1;
-    app_set_file(app, next_idx);
+    if (app->files.current != NULL) {
+        if (app->files.current == app->files.head) {
+            app->files.current = app->files.tail;
+        } else {
+            app->files.current = app->files.current->prev;
+        }
+    }
+
     SDL_RenderClear(app->ren);
     app_render_file(app);
     SDL_RenderPresent(app->ren);
@@ -293,8 +385,14 @@ void app_render_prev_file(app_t *app)
 
 void app_render_next_file(app_t *app)
 {
-    size_t next_idx = app->file_idx + 1 == app->files_idx ? 0 : app->file_idx + 1;
-    app_set_file(app, next_idx);
+    if (app->files.current != NULL) {
+        if (app->files.current == app->files.tail) {
+            app->files.current = app->files.head;
+        } else {
+            app->files.current = app->files.current->next;
+        }
+    }
+
     SDL_RenderClear(app->ren);
     app_render_file(app);
     SDL_RenderPresent(app->ren);
@@ -336,6 +434,7 @@ file_t *file_load(ren_t *ren, const char *path, float x, float y, float w, float
     file->rect.h = h;
     file->nat_w = nat_w;
     file->nat_h = nat_h;
+    file->prev = file->next = NULL;
     
     return file;
 
@@ -407,13 +506,13 @@ void ev_multigesture(const SDL_MultiGestureEvent *ev, app_t *app)
         SDL_GetMouseState(&win_mouse_x, &win_mouse_y);
         app_to_screen(app, win_mouse_x, win_mouse_y, &mouse_x, &mouse_y);
 
-        app->file->rect.w *= scale;
-        app->file->rect.h *= scale;
-        app->file->rect.x = mouse_x - (mouse_x - app->file->rect.x) * scale;
-        app->file->rect.y = mouse_y - (mouse_y - app->file->rect.y) * scale;
+        app->files.current->rect.w *= scale;
+        app->files.current->rect.h *= scale;
+        app->files.current->rect.x = mouse_x - (mouse_x - app->files.current->rect.x) * scale;
+        app->files.current->rect.y = mouse_y - (mouse_y - app->files.current->rect.y) * scale;
 
         SDL_RenderClear(app->ren);
-        file_render(app->ren, app->file);
+        file_render(app->ren, app->files.current);
         SDL_RenderPresent(app->ren);
     }
 }
@@ -450,12 +549,12 @@ void ev_mousemotion(const SDL_MouseMotionEvent *ev, app_t *app)
         float mouse_x, mouse_y;
         app_to_screen(app, ev->x, ev->y, &mouse_x, &mouse_y);
 
-        app->file->rect.x += (mouse_x - btn_l->x);
-        app->file->rect.y += (mouse_y - btn_l->y);
+        app->files.current->rect.x += (mouse_x - btn_l->x);
+        app->files.current->rect.y += (mouse_y - btn_l->y);
         btn_l->x = mouse_x;
         btn_l->y = mouse_y;
         SDL_RenderClear(app->ren);
-        file_render(app->ren, app->file);
+        file_render(app->ren, app->files.current);
         SDL_RenderPresent(app->ren);
     }
 }
@@ -468,13 +567,13 @@ void ev_mousewheel(const SDL_MouseWheelEvent *ev, app_t *app)
     float mouse_x, mouse_y;
     app_to_screen(app, ev->mouseX, ev->mouseY, &mouse_x, &mouse_y);
 
-    app->file->rect.w *= scale;
-    app->file->rect.h *= scale;
-    app->file->rect.x = mouse_x - (mouse_x - app->file->rect.x) * scale;
-    app->file->rect.y = mouse_y - (mouse_y - app->file->rect.y) * scale;
+    app->files.current->rect.w *= scale;
+    app->files.current->rect.h *= scale;
+    app->files.current->rect.x = mouse_x - (mouse_x - app->files.current->rect.x) * scale;
+    app->files.current->rect.y = mouse_y - (mouse_y - app->files.current->rect.y) * scale;
 
     SDL_RenderClear(app->ren);
-    file_render(app->ren, app->file);
+    file_render(app->ren, app->files.current);
     SDL_RenderPresent(app->ren);
 }
 
