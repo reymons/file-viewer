@@ -3,8 +3,10 @@
 #include <time.h>
 #include <dirent.h>
 #include <limits.h>
-#include <pthread.h>
-#include <unistd.h>
+#include <assert.h>
+#include <stdarg.h>
+
+#define DEBUG
 
 #define WIN_WIDTH       800
 #define WIN_HEIGHT      600
@@ -63,29 +65,36 @@ typedef struct {
     size_t              max;
 } app_ldt_ctx_t;
 
-// Misc 
-int has_ext(const char *str, const char *ext);
-int is_image(const char *path);
+// Misc
+int  has_ext(const char *str, const char *ext);
+int  is_image(const char *path);
+void log_msg(const char *format, ...);
 
 // App
 void app_fail(const char *label);
+void app_add_file(app_t *app, file_t *file);
+void app_remove_file(app_t *app, file_t *file);
+void app_set_current_file(app_t *app, file_t *file);
 void app_update_size_data(app_t *app);
-void app_free_files(app_t *app);
-void app_render_file(app_t *app);
-void app_to_screen(const app_t *app, float x, float y, float *dst_x, float *dst_y);
-void app_load_dir(app_t *app, const char *path, size_t max);
-void app_set_file(app_t *app, size_t file_idx);
+void app_render_current_file(app_t *app);
 void app_render_random_file(app_t *app);
 void app_render_prev_file(app_t *app);
 void app_render_next_file(app_t *app);
+void app_free_files(app_t *app);
+void app_to_screen(const app_t *app, float x, float y, float *dst_x, float *dst_y);
+void app_load_dir(app_t *app, const char *path, size_t max);
 
 // Renderer
 void ren_set_draw_color(ren_t *ren, uint32_t hex);
 
 // File
-file_t *file_load(ren_t *ren, const char *path, float x, float y, float w, float h);
+#define file_assert_notnull(file) assert(file != NULL && "File shouldn't be NULL")
+
+file_t *file_create(const char *path, float x, float y, float w, float h);
 void file_free(file_t *file);
-void file_render(ren_t *ren, file_t *file);
+void file_render(file_t *file, ren_t *ren);
+int  file_load_texture(file_t *file, ren_t *ren);
+void file_destroy_texture(file_t *file);
 
 // Events
 int  SDLCALL ev_handler(void *data, SDL_Event *ev);
@@ -161,12 +170,12 @@ int main(int argc, char *argv[])
 
     // Find initial file
     if (file_name == NULL) {
-        app.files.current = app.files.head;
+        app_set_current_file(&app, app.files.head);
     } else {
         file_t *file = app.files.head;
         while (file != NULL) {
             if (SDL_strcmp(file->path, file_name) == 0) {
-                app.files.current = file;
+                app_set_current_file(&app, file);
                 break;
             }
             file = file->next;
@@ -174,12 +183,12 @@ int main(int argc, char *argv[])
     }
 
     if (app.files.current == NULL) {
-        SDL_Log("Can't find any file");
+        log_msg("Can't find any file");
         exit(1);
     }
 
     app_update_size_data(&app);
-    app_render_file(&app);
+    app_render_current_file(&app);
     SDL_RenderPresent(app.ren);
 
     SDL_Event ev;
@@ -212,11 +221,97 @@ int is_image(const char *path)
            has_ext(path, ".jpeg");
 }
 
+void log_msg(const char *format, ...)
+{
+    (void)format;
+#ifdef DEBUG
+    va_list args;
+    va_start(args, format);
+    vprintf(format, args);
+    va_end(args);
+#endif
+}
+
 // App
 void app_fail(const char *label)
 {
-    SDL_Log("%s: %s\n", label, SDL_GetError());
+    log_msg("%s: %s\n", label, SDL_GetError());
     exit(1);   
+}
+
+void app_add_file(app_t *app, file_t *file)
+{
+    if (app->files.total == MAX_FILES - 1) return;
+
+    file_assert_notnull(file);
+    
+    if (app->files.head == NULL) {
+        app->files.head = app->files.tail = file;
+        file->prev = file->next = NULL;
+    } else {
+        app->files.tail->next = file;
+        file->prev = app->files.tail;
+        app->files.tail = file;
+    }
+
+    app->files.total++;
+}
+
+void app_remove_file(app_t *app, file_t *file)
+{
+    if (app->files.total == 0) return;
+
+    file_assert_notnull(file);
+    file_t *maybe_next_current = NULL;
+
+    if (app->files.head == file) {
+        app->files.head = file->next;
+        maybe_next_current = file->next;
+    } else {
+        file->prev->next = file->next;
+        maybe_next_current = file->prev;
+    }
+    
+    if (app->files.tail == file) {
+        app->files.tail = file->prev;
+    } else {
+        file->next->prev = file->prev;
+    }
+
+    if (app->files.current == file) {
+        app->files.current = NULL;
+        
+        if (maybe_next_current != NULL) {
+            app_set_current_file(app, maybe_next_current);
+        }
+    }
+
+    file_free(file);
+    app->files.total--;
+}
+
+void app_set_current_file(app_t *app, file_t *file)
+{
+    file_assert_notnull(file);
+    log_msg("Setting %s\n", file->path);
+
+    if (app->files.current != file && file_load_texture(file, app->ren) == 1) {
+        if (app->files.current != NULL) {
+            file_destroy_texture(app->files.current);
+        }
+        app->files.current = file;
+    }
+}
+
+void app_free_files(app_t *app)
+{
+    file_t *file = app->files.head;
+    
+    while (file != NULL) {
+        file_t *next = file->next;
+        file_free(file);
+        file = next;
+    }
 }
 
 void app_update_size_data(app_t *app)
@@ -230,18 +325,45 @@ void app_update_size_data(app_t *app)
     app->screen_h = screen_h * 1.0;
 }
 
-void app_free_files(app_t *app)
+void app_to_screen(const app_t *app, float x, float y, float *dst_x, float *dst_y)
 {
-    file_t *file = app->files.head;
-    while (file != NULL) {
-        file_t *next = file->next;
-        file_free(file);
-        file = next;
-    }
+    *dst_x = x * (app->screen_w / app->win_w);
+    *dst_y = y * (app->screen_h / app->win_h);
 }
 
-void app_render_file(app_t *app)
+void app_load_dir(app_t *app, const char *path, size_t max)
 {
+    DIR *dir = opendir(path);
+    if (dir == NULL) app_fail("opendir");
+
+    struct dirent *dent;
+    size_t i = 0;
+    max %= (MAX_FILES + 1);
+
+    while ((dent = readdir(dir)) != NULL && i < max) {
+        if (dent->d_type == DT_REG && is_image(dent->d_name)) {
+            char filepath[FILEPATH_MAX];
+            SDL_snprintf(filepath, FILEPATH_MAX, "%s/%s", path, dent->d_name);
+            log_msg("Loading %s\n", filepath);
+            file_t *file = file_create(filepath, 0, 0, 0, 0);
+            
+            if (file != NULL) {
+                app_add_file(app, file);
+                i++;
+            }
+        }
+    }
+
+    closedir(dir);
+}
+
+void app_render_current_file(app_t *app)
+{
+    if (app->files.current == NULL) {
+        SDL_SetWindowTitle(app->win, "");
+        return;
+    }
+
     SDL_SetWindowTitle(app->win, app->files.current->path);
 
     float tex_aspect = app->files.current->nat_w / app->files.current->nat_h;
@@ -260,142 +382,65 @@ void app_render_file(app_t *app)
     app->files.current->rect.x = app->screen_w / 2 - app->files.current->rect.w / 2;
     app->files.current->rect.y = app->screen_h / 2 - app->files.current->rect.h / 2;
     
-    file_render(app->ren, app->files.current);
-}
-
-void app_to_screen(const app_t *app, float x, float y, float *dst_x, float *dst_y)
-{
-    *dst_x = x * (app->screen_w / app->win_w);
-    *dst_y = y * (app->screen_h / app->win_h);
-}
-
-void *app_load_dir_thread(void *data)
-{
-    app_ldt_ctx_t *ctx = (app_ldt_ctx_t *)data;
-    struct dirent *ent;
-
-    while (1) {
-        pthread_mutex_lock(&ctx->lock);
-        ent = readdir(ctx->dir);
-        pthread_mutex_unlock(&ctx->lock);
-        
-        if (ent == NULL) break;
-        
-        if (ent->d_type == DT_REG && is_image(ent->d_name)) {
-            char file_path[FILEPATH_MAX]; 
-            SDL_snprintf(file_path, FILEPATH_MAX, "%s/%s", ctx->path, ent->d_name);
-            SDL_Log("Loading %s\n", file_path);
-            
-            file_t *file = file_load(ctx->app->ren, file_path, 0, 0, 0, 0);
-
-            if (file != NULL) {
-                file->ino = ent->d_ino;
-
-                pthread_mutex_lock(&ctx->lock);
-                ctx->app->files.total++;
-
-                if (ctx->app->files.head == NULL) {
-                    ctx->app->files.head = file;
-                    ctx->app->files.tail = file;
-                    ctx->app->files.current = file;
-                    file->prev = file->next = NULL;
-                } else {
-                    file->prev = ctx->app->files.tail;
-                    ctx->app->files.tail->next = file;
-                    ctx->app->files.tail = file;
-                    ctx->app->files.current = file;
-                }
-
-                pthread_mutex_unlock(&ctx->lock);
-            }
-        }
-    }
-
-    return NULL;
-}
-
-void app_load_dir(app_t *app, const char *path, size_t max)
-{
-    DIR *dir = opendir(path);
-    if (dir == NULL) app_fail("opendir");
-
-    pthread_t tids[24] = {0};
-    size_t cpus = (sysconf(_SC_NPROCESSORS_ONLN) + 2) % sizeof(tids);
-
-    app_ldt_ctx_t ctx = {
-        .dir  = dir,
-        .app  = app,
-        .path = path,
-        .i    = 0,
-        .max  = max % (MAX_FILES + 1),
-    };
-
-    pthread_mutex_init(&ctx.lock, NULL);
-    
-    for (size_t i = 0; i < cpus; i++) {
-        if (pthread_create(&tids[i], NULL, app_load_dir_thread, &ctx) != 0) {
-            SDL_Log("Couldn't create a thread\n");
-            exit(1);
-        }
-    }
-
-    for (size_t i = 0; i < cpus; i++) {
-        if (pthread_join(tids[i], NULL) != 0) {
-            SDL_Log("Couldn't wait for a thread\n");
-            exit(1);
-        }
-    }
-
-    closedir(dir);
+    file_render(app->files.current, app->ren);
 }
 
 void app_render_random_file(app_t *app)
 {
-    size_t idx = rand() % app->files.total;
+    size_t idx = app->files.total > 0 ? rand() % app->files.total : 0;
     size_t i = 0;
     file_t *file = app->files.head;
 
-    while (file != NULL) {
-        if (idx == i++) break;
+    while (file != NULL && idx != i++) {
         file = file->next;
     }
 
     if (file != NULL) {
         SDL_RenderClear(app->ren);
-        app->files.current = file;
-        app_render_file(app);
+        app_set_current_file(app, file);
+        app_render_current_file(app);
         SDL_RenderPresent(app->ren);
     }
 } 
 
 void app_render_prev_file(app_t *app)
 {
+    file_t *file = NULL;
+
     if (app->files.current != NULL) {
         if (app->files.current == app->files.head) {
-            app->files.current = app->files.tail;
+            file = app->files.tail;
         } else {
-            app->files.current = app->files.current->prev;
+            file = app->files.current->prev;
         }
     }
 
-    SDL_RenderClear(app->ren);
-    app_render_file(app);
-    SDL_RenderPresent(app->ren);
+    if (file != NULL) {
+        SDL_RenderClear(app->ren);
+        app_set_current_file(app, file);
+        app_render_current_file(app);
+        SDL_RenderPresent(app->ren);
+    }
 }
 
 void app_render_next_file(app_t *app)
 {
+    file_t *file = NULL;
+
     if (app->files.current != NULL) {
         if (app->files.current == app->files.tail) {
-            app->files.current = app->files.head;
+            file = app->files.head;
         } else {
-            app->files.current = app->files.current->next;
+            file = app->files.current->next;
         }
     }
 
-    SDL_RenderClear(app->ren);
-    app_render_file(app);
-    SDL_RenderPresent(app->ren);
+    if (file != NULL) {
+        app_set_current_file(app, file);
+        SDL_RenderClear(app->ren);
+        app_render_current_file(app);
+        SDL_RenderPresent(app->ren);
+    }
 }
 
 // Renderer
@@ -410,51 +455,74 @@ void ren_set_draw_color(ren_t *ren, uint32_t hex) {
 }
 
 // File
-file_t *file_load(ren_t *ren, const char *path, float x, float y, float w, float h)
+file_t *file_create(const char *path, float x, float y, float w, float h)
 {
     file_t *file = SDL_calloc(1, sizeof(file_t));
     if (file == NULL) return NULL;
 
-    file->tex = IMG_LoadTexture(ren, path);
-    if (file->tex == NULL) goto free;
-    
-    int nat_w, nat_h;
-    if (SDL_QueryTexture(file->tex, NULL, NULL, &nat_w, &nat_h) != 0) goto free;
-
     size_t path_len = sizeof(char) * (SDL_strlen(path) + 1);
-    
     file->path = SDL_malloc(path_len);
-    if (file->path == NULL) goto free;
+    
+    if (file->path == NULL) {
+        file_free(file);
+        return NULL;
+    }
     
     (void)SDL_strlcpy(file->path, path, path_len);
-    
+
     file->rect.x = x;
     file->rect.y = y;
     file->rect.w = w;
     file->rect.h = h;
-    file->nat_w = nat_w;
-    file->nat_h = nat_h;
+    file->nat_w = 0;
+    file->nat_h = 0;
     file->prev = file->next = NULL;
+    file->tex = NULL;
     
     return file;
-
-free:
-    file_free(file);
-    return NULL;
 }
 
 void file_free(file_t *file)
 {
-    SDL_DestroyTexture(file->tex);
+    file_assert_notnull(file);
+    file_destroy_texture(file);
     SDL_free(file->path);
-    file->tex = NULL;
     file->path = NULL;
     SDL_free(file);
 }
 
-void file_render(ren_t *ren, file_t *file)
+int file_load_texture(file_t *file, ren_t *ren)
 {
-    SDL_RenderCopyF(ren, file->tex, NULL, &file->rect); 
+    file_assert_notnull(file);
+    log_msg("Loding texture for %s\n", file->path);
+
+    file->tex = IMG_LoadTexture(ren, file->path);
+    
+    int nat_w, nat_h;
+    
+    if (SDL_QueryTexture(file->tex, NULL, NULL, &nat_w, &nat_h) < 0) {
+        file->tex = NULL;
+        log_msg("Failed to load the texture\n");
+        return 0;
+    }
+
+    file->nat_w = nat_w;
+    file->nat_h = nat_h;
+
+    return 1;
+}
+
+void file_destroy_texture(file_t *file)
+{
+    file_assert_notnull(file);
+    SDL_DestroyTexture(file->tex);
+    file->tex = NULL;
+}
+
+void file_render(file_t *file, ren_t *ren)
+{
+    file_assert_notnull(file);
+    SDL_RenderCopyF(ren, file->tex, NULL, &file->rect);
 }
 
 // Events
@@ -494,7 +562,10 @@ int SDLCALL ev_handler(void *data, SDL_Event *ev)
 
 void ev_multigesture(const SDL_MultiGestureEvent *ev, app_t *app)
 {
-    if (ev->numFingers == 2 && !app->mbuttons[MBUTTON_LEFT].pressed) {
+    if (ev->numFingers == 2 &&
+        !app->mbuttons[MBUTTON_LEFT].pressed &&
+        app->files.current != NULL
+    ) {
         float scale_factor = 1.035;
         float scale = 1;
         
@@ -512,7 +583,7 @@ void ev_multigesture(const SDL_MultiGestureEvent *ev, app_t *app)
         app->files.current->rect.y = mouse_y - (mouse_y - app->files.current->rect.y) * scale;
 
         SDL_RenderClear(app->ren);
-        file_render(app->ren, app->files.current);
+        file_render(app->files.current, app->ren);
         SDL_RenderPresent(app->ren);
     }
 }
@@ -522,7 +593,7 @@ void ev_window(const SDL_WindowEvent *ev, app_t *app)
     if (ev->event == SDL_WINDOWEVENT_RESIZED) {
         SDL_RenderClear(app->ren);
         app_update_size_data(app);
-        app_render_file(app);
+        app_render_current_file(app);
         SDL_RenderPresent(app->ren);
     }
 }
@@ -545,36 +616,37 @@ void ev_mousemotion(const SDL_MouseMotionEvent *ev, app_t *app)
 
     mbutton_t *btn_l = &app->mbuttons[MBUTTON_LEFT];
 
-    if (btn_l->pressed) {
+    if (btn_l->pressed && app->files.current != NULL) {
         float mouse_x, mouse_y;
         app_to_screen(app, ev->x, ev->y, &mouse_x, &mouse_y);
-
         app->files.current->rect.x += (mouse_x - btn_l->x);
         app->files.current->rect.y += (mouse_y - btn_l->y);
         btn_l->x = mouse_x;
         btn_l->y = mouse_y;
         SDL_RenderClear(app->ren);
-        file_render(app->ren, app->files.current);
+        file_render(app->files.current, app->ren);
         SDL_RenderPresent(app->ren);
     }
 }
 
 void ev_mousewheel(const SDL_MouseWheelEvent *ev, app_t *app)
 {
-    float scale_factor = 1.1;
-    float scale = ev->y < 0 ? scale_factor : 1/scale_factor;
-    
-    float mouse_x, mouse_y;
-    app_to_screen(app, ev->mouseX, ev->mouseY, &mouse_x, &mouse_y);
+    if (app->files.current != NULL) {
+        float scale_factor = 1.1;
+        float scale = ev->y < 0 ? scale_factor : 1/scale_factor;
+        
+        float mouse_x, mouse_y;
+        app_to_screen(app, ev->mouseX, ev->mouseY, &mouse_x, &mouse_y);
 
-    app->files.current->rect.w *= scale;
-    app->files.current->rect.h *= scale;
-    app->files.current->rect.x = mouse_x - (mouse_x - app->files.current->rect.x) * scale;
-    app->files.current->rect.y = mouse_y - (mouse_y - app->files.current->rect.y) * scale;
+        app->files.current->rect.w *= scale;
+        app->files.current->rect.h *= scale;
+        app->files.current->rect.x = mouse_x - (mouse_x - app->files.current->rect.x) * scale;
+        app->files.current->rect.y = mouse_y - (mouse_y - app->files.current->rect.y) * scale;
 
-    SDL_RenderClear(app->ren);
-    file_render(app->ren, app->files.current);
-    SDL_RenderPresent(app->ren);
+        SDL_RenderClear(app->ren);
+        file_render(app->files.current, app->ren);
+        SDL_RenderPresent(app->ren);
+    }
 }
 
 void ev_keyup(const SDL_KeyboardEvent *ev, app_t *app)
@@ -590,6 +662,12 @@ void ev_keyup(const SDL_KeyboardEvent *ev, app_t *app)
             break;
         case SDLK_r:
             app_render_random_file(app);
+            break;
+        case SDLK_k:
+            app_remove_file(app, app->files.current);
+            SDL_RenderClear(app->ren);
+            app_render_current_file(app);
+            SDL_RenderPresent(app->ren);
             break;
     }
 }
