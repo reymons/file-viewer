@@ -1,6 +1,6 @@
 ### Setup
 ```
-git clone git@github.com:reymons/file-viewer.git --recursive
+git clone https://github.com/reymons/file-viewer.git --recursive
 cd file-viewer
 make init
 ```
