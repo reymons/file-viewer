@@ -12,6 +12,8 @@ CC_LIBS=$(foreach DEP,$(DEPS),-l$(DEP))
 CFLAGS=-O3 -Wall -Wextra -pedantic $(CC_INCLUDES) $(CC_LIB_DIRS) $(CC_LIBS)
 SDL2_CONFIG=$(LIBS_DIR)/SDL2/bin/sdl2-config
 
+.PHONY: clean clean_all $(DEPS)
+
 all:
 	$(CC) $(CFLAGS) -o $(OUT) main.c
 
